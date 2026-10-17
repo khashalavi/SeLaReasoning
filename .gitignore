@@ -1,2 +1,9 @@
 #macOS
 .DS_Store
+
+# python caches (the cluster jobs keep theirs on Lustre via PYTHONPYCACHEPREFIX)
+__pycache__/
+.pytest_cache/
+
+# the built documentation (zensical build)
+site/

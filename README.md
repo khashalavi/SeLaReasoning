@@ -75,6 +75,34 @@ python scripts/merge.py --model_name Qwen/Qwen3-8B --dataset_name gsm8k \
     --max_new_tokens 32768 --method selar
 ```
 
+## 🧪 SeLaR-X: Extension Experiments (this fork)
+
+The training-free extensions planned in `improvement.md` live in `src/selarx.py`,
+behind one decoding loop shared with the CoT and vanilla SeLaR baselines:
+`layer` (hidden-state steering), `sem` (semantic entropy + dynamic threshold),
+`ltr` (multi-step latent rollouts), `fhg` (attention/FFN gating), `dynk`
+(nucleus dynamic-k), and any `+`-combination of them (e.g. `sem+dynk`).
+
+```bash
+./Sela_beat.sh --plan        # what the SELECTION block in Sela_beat.sh expands to
+sbatch Sela_beat.sh --smoke  # every method end-to-end on a tiny model (sgpu_devel)
+sbatch Sela_beat.sh          # the hourly heart beat: submits / resubmits / merges everything
+./reporting.sh               # -> result/selar_report.md
+python -m pytest tests/      # CPU tests: the loop reproduces the upstream baselines token for token
+```
+
+All outputs (venv, model weights, caches, per-problem results, logs, journal)
+go to `/lustre/scratch/data/s76kalav_hpc-memory/selareasoning`; only the
+report is written into the repo.
+
+The full documentation (methods with formulas, every option of
+`Sela_beat.sh`, file formats, troubleshooting, findings so far) is a Zensical
+site in `docs/`: `pip install zensical`, then `zensical serve`
+(http://localhost:8000) or `zensical build` (static site in `site/`). Note: in a batch, the upstream
+`generate_selar` feeds soft embeddings to *every* row as soon as *any* row is
+uncertain, so its results depend on the batch size; `selar` gates per row
+(Algorithm 1), `selar_upstream` keeps the original behaviour for comparison.
+
 ## 📁 Repository Structure
 
 ```
@@ -82,9 +110,16 @@ SeLaReasoning/
 ├── src/                          # Core source code
 │   ├── generation_utils.py       # Generation functions (CoT, SeLaR, etc.)
 │   ├── grader.py                 # Answer extraction and grading
+│   ├── selarx.py                 # SeLaR-X: SeLaR + the improvement.md ideas
 ├── scripts/                      # Execution scripts
 │   ├── run.py                    # Main evaluation script
 │   ├── merge.py                  # Result merging utility
+│   ├── sela_run.py               # SeLaR-X: one resumable shard (GPU job)
+│   ├── sela_tools.py             # SeLaR-X: merge shards, status table
+│   ├── sela_report.py            # SeLaR-X: the final report
+├── tests/test_selarx.py          # CPU tests of src/selarx.py
+├── Sela_beat.sh                  # SeLaR-X heart beat (Slurm orchestrator)
+├── reporting.sh                  # SeLaR-X report -> result/selar_report.md
 ├── datasets/                     # Benchmark datasets
 │   ├── gsm8k_test/
 │   ├── math_500_test/

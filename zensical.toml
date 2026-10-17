@@ -1,0 +1,111 @@
+# Documentation site for SeLaReasoning (SeLaR-X), built with Zensical.
+#   pip install zensical
+#   zensical serve      # live preview on http://localhost:8000
+#   zensical build      # static site in ./site (gitignored)
+[project]
+site_name = "SeLaR-X"
+site_description = "Selective latent reasoning and its training-free extensions: methods, the Sela_beat pipeline, options and findings"
+docs_dir = "docs"
+site_dir = "site"
+# Zensical renders formulas only with a math script: MathJax, configured in
+# docs/javascripts/mathjax.js for pymdownx.arithmatex (generic mode).
+extra_javascript = [
+  "javascripts/mathjax.js",
+  "https://unpkg.com/mathjax@3.2.2/es5/tex-mml-chtml.js",
+]
+nav = [
+  { "Home" = "index.md" },
+  { "Background" = [
+    "background/index.md",
+    { "The upstream code" = "background/upstream-code.md" },
+    { "Fair comparisons" = "background/fair-comparison.md" },
+  ] },
+  { "Methods" = [
+    "methods/index.md",
+    { "Baselines" = "methods/baselines.md" },
+    { "Variant 1 · Layer steering" = "methods/layer.md" },
+    { "Variant 2 · Semantic gating" = "methods/sem.md" },
+    { "Variant 3 · Latent rollouts" = "methods/ltr.md" },
+    { "Variant 4 · Functional gating" = "methods/fhg.md" },
+    { "Variant 5 · Dynamic k" = "methods/dynk.md" },
+    { "Variant 6 · Combinations" = "methods/combinations.md" },
+  ] },
+  { "Guide" = [
+    "guide/index.md",
+    { "Environment setup" = "guide/setup.md" },
+    { "Running Sela_beat" = "guide/heart-beat.md" },
+    { "Selection options" = "guide/selection.md" },
+    { "Hyper-parameters" = "guide/parameters.md" },
+    { "Resources and timing" = "guide/resources.md" },
+    { "Smoke test" = "guide/smoke-test.md" },
+    { "Manual runs and tests" = "guide/manual-runs.md" },
+    { "What is saved where" = "guide/outputs.md" },
+    { "Reporting" = "guide/reporting.md" },
+    { "Troubleshooting" = "guide/troubleshooting.md" },
+  ] },
+  { "Findings" = "findings/index.md" },
+  { "Reference" = [
+    "reference/index.md",
+    { "sela_run.py" = "reference/sela-run.md" },
+    { "selarx.py API" = "reference/selarx-api.md" },
+    { "File formats" = "reference/formats.md" },
+    { "sela_tools.py and sela_report.py" = "reference/tools.md" },
+  ] },
+]
+
+[project.theme]
+language = "en"
+features = [
+  "content.code.annotate",
+  "content.code.copy",
+  "content.tabs.link",
+  "content.tooltips",
+  "navigation.footer",
+  "navigation.indexes",
+  "navigation.instant",
+  "navigation.path",
+  "navigation.sections",
+  "navigation.tabs",
+  "navigation.tabs.sticky",
+  "navigation.top",
+  "navigation.tracking",
+  "search.highlight",
+  "toc.follow",
+]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to light mode"
+
+[project.markdown_extensions]
+abbr = {}
+admonition = {}
+attr_list = {}
+def_list = {}
+footnotes = {}
+md_in_html = {}
+tables = {}
+toc.permalink = true
+pymdownx.arithmatex.generic = true
+pymdownx.betterem = {}
+pymdownx.details = {}
+pymdownx.highlight.anchor_linenums = true
+pymdownx.highlight.pygments_lang_class = true
+pymdownx.inlinehilite = {}
+pymdownx.keys = {}
+pymdownx.mark = {}
+pymdownx.smartsymbols = {}
+pymdownx.superfences.custom_fences = [
+  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+]
+pymdownx.tabbed.alternate_style = true
+pymdownx.tabbed.combine_header_slug = true
+pymdownx.tasklist.custom_checkbox = true
