@@ -95,6 +95,16 @@ All outputs (venv, model weights, caches, per-problem results, logs, journal)
 go to `/lustre/scratch/data/s76kalav_hpc-memory/selareasoning`; only the
 report is written into the repo.
 
+On the **bender** cluster use `Sela_beat_bender.sh` and `reporting_bender.sh`
+(same flags, same SELECTION). They run on bender's A40 partitions, store
+everything in `./sela_data/` (git-ignored; bender has no Lustre) and write
+`result/selar_report_bender.md`. See `docs/guide/bender.md`.
+
+```bash
+sbatch Sela_beat_bender.sh   # bender heart beat
+./reporting_bender.sh        # -> result/selar_report_bender.md
+```
+
 The full documentation (methods with formulas, every option of
 `Sela_beat.sh`, file formats, troubleshooting, findings so far) is a Zensical
 site in `docs/`: `pip install zensical`, then `zensical serve`

@@ -34,6 +34,7 @@ nav = [
     "guide/index.md",
     { "Environment setup" = "guide/setup.md" },
     { "Running Sela_beat" = "guide/heart-beat.md" },
+    { "Running on bender" = "guide/bender.md" },
     { "Selection options" = "guide/selection.md" },
     { "Hyper-parameters" = "guide/parameters.md" },
     { "Resources and timing" = "guide/resources.md" },

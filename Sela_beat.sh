@@ -10,14 +10,22 @@
 # NOTE: CPU-only orchestrator (no --gres), submitted like Disentangling-
 # Reasoning's heart_beat.sh on marvin. --partition must allow the 24h --time
 # above (sgpu_medium does; *_devel caps at 1h). Keep TIME_LIMIT_SECONDS below
-# in sync with --time.
+# in sync with --time. The #SBATCH lines are marvin's; on bender submit
+# Sela_beat_bender.sh instead, which runs this file with SELA_SERVER=bender.
 # ============================================================================
 # Sela_beat.sh — the heart beat of the SeLaR-X experiments (improvement.md):
 # hourly (re-)submission of every (method, model, dataset, seed, shard) the
 # SELECTION below asks for, with a journal so we always know exactly which
 # Slurm job belongs to which piece of work.
 #
-# EVERYTHING IS WRITTEN TO LUSTRE ($SELA_ROOT), NEVER INTO THE REPO:
+# SERVERS (the RESOURCES block below has one profile per cluster):
+#   marvin  sbatch Sela_beat.sh          $SELA_ROOT on Lustre; A100 80GB shards
+#   bender  sbatch Sela_beat_bender.sh   no Lustre: $SELA_ROOT = <repo>/sela_data
+#                                        (git-ignored); A40 shards
+#   Both run this same file -- SELECTION, flags and journal are shared; each
+#   cluster keeps its own $SELA_ROOT tree and report.
+#
+# EVERYTHING IS WRITTEN TO $SELA_ROOT (marvin: Lustre), NEVER INTO THE REPO:
 #   env/                 Python venv (torch + requirements-sela.txt), built once
 #   models/<org>/<name>  model weights, downloaded once (.download_complete marker)
 #   hf_home/ cache/      HF hub / pip / triton / pycache caches
@@ -29,14 +37,16 @@
 #   plan.tsv             the expanded SELECTION of the last pass (reporting.sh reads it)
 #   status.out           progress table, rewritten every pass
 #   reports/             report history + all_runs.csv (reporting.sh)
-# The one file that lands in the repo is the final report ./result/selar_report.md,
-# written by reporting.sh -- run after every pass when AUTO_REPORT=1.
+# (bender: that tree is <repo>/sela_data/, with the venv in env_a40/ or env_a100/.)
+# The one file that lands in the repo is the final report ./result/selar_report.md
+# (bender: ./result/selar_report_bender.md), written by reporting.sh -- run
+# after every pass when AUTO_REPORT=1.
 #
 # WHAT ONE PASS DOES (every CHECK_INTERVAL, default 1h):
 #   0. prerequisites, each its own Slurm job, submitted once and tracked like
-#      everything else:  env not built -> --setup-env job (GPU node: the venv
-#      must be built from the AMD module tree, like setup-env/build_env_a100_
-#      marvin.slurm);  model not in models/ -> --download job per model.
+#      everything else:  env not built -> --setup-env job (on the node type
+#      the shards use: a venv only runs on the CPU family it was built for,
+#      see load_python_module);  model not in models/ -> --download job per model.
 #      Shards of a model wait until both are ready.
 #   1. expand SELECTION -> runs -> shards (= GPU jobs), write plan.tsv
 #   2. for every shard:
@@ -57,7 +67,8 @@
 #          RESET <slurm-state>
 #
 # HOW TO RUN -- submit it once:
-#     sbatch Sela_beat.sh
+#     sbatch Sela_beat.sh               (marvin)
+#     sbatch Sela_beat_bender.sh        (bender; same flags as below)
 #   It runs ~24h (#SBATCH --time), checking hourly, and ~10 min before the
 #   wall clock it submits a FRESH Sela_beat job and exits, so it keeps going
 #   indefinitely. Edit the SELECTION while it runs: at the next pass it
@@ -73,7 +84,7 @@
 #     --status        one pass that only reports (journal + live queue)
 #     --once          a single real pass, no hourly loop
 #     --smoke         tiny end-to-end check of every method (Qwen3-0.6B, 4 GSM8K
-#                     problems, 512 tokens, sgpu_devel) in $SELA_ROOT/smoke/;
+#                     problems, 512 tokens, SMOKE_PARTITION) in $SELA_ROOT/smoke/;
 #                     checks every 5 min and exits when all of it is merged
 #                     (report: ./reporting.sh --smoke)
 #     --retry-failed  reset the stall counters of GAVE_UP shards / jobs
@@ -116,7 +127,10 @@ METHODS=(cot selar layer sem ltr fhg dynk)
 COMBOS=()
 
 MODELS=(
-    "Qwen/Qwen3-8B"
+    #"Qwen/Qwen3-8B"
+    "Qwen/Qwen3.5-2B"                       # newer backbone (Qwen3.5, 2026): hybrid -- 18 Gated DeltaNet
+                                            #   (linear attention) + 6 attention layers; chat model, run
+                                            #   non-thinking; transformers 5 (env_tf5, TF5_MODELS); not gated
     # "Qwen/Qwen3-1.7B"
     # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"     # less calibrated (Idea 2)
 )
@@ -210,17 +224,58 @@ SWIR_ALPHA=1.0;          SWIR_ALPHA_SWEEP=(0.6 0.9 1.0)
 SWIR_MAX_SWITCH=none;    SWIR_MAX_SWITCH_SWEEP=(none)          # none | N
 
 # ---------------------------------------------------------------------------
-# RESOURCES
+# RESOURCES — one profile per cluster. SELA_SERVER is marvin for Sela_beat.sh
+# and bender for Sela_beat_bender.sh (which runs this file); the SELECTION
+# above is shared.
 # ---------------------------------------------------------------------------
-SELA_ROOT="${SELA_ROOT:-/lustre/scratch/data/s76kalav_hpc-memory/selareasoning}"
-GPU_PARTITION=sgpu_short        # A100 nodes, 8h. mlgpu_short = A40 48GB: halve BATCH_SIZE
+SERVER="${SELA_SERVER:-marvin}"
+case "$SERVER" in
+    marvin)
+        # Everything on the Lustre workspace -- the home quota is small.
+        SELA_ROOT="${SELA_ROOT:-/lustre/scratch/data/s76kalav_hpc-memory/selareasoning}"
+        GPU_PARTITION=sgpu_short        # A100 80GB nodes, 8h. mlgpu_short = A40 48GB: GPU_SCALE=0.5
+        ENV_PARTITION=sgpu_devel        # --setup-env (needs an AMD GPU node; ~3 min)
+        DOWNLOAD_PARTITION=sgpu_short   # --download (CPU only, 32G)
+        SMOKE_PARTITION=sgpu_devel      # --smoke shards (30 min)
+        GPU_MEM=64G
+        GPU_SCALE=1                     # factor on BATCH_SIZE and SHARD_SIZE below
+        ENV_NAME=env                    # the venv: $SELA_ROOT/$ENV_NAME
+        # Every marvin GPU node is AMD EPYC: Python from the AMD EasyBuild tree.
+        AMD_MODULEPATH="/opt/software/easybuild-AMD/modules/all"
+        TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128"
+        SYS_PYTHON=/usr/bin/python3     # stdlib-only helpers (merge, status) in this CPU job
+        REPORT_FILE=selar_report.md     # ./result/<this>, written by reporting.sh
+        ;;
+    bender)
+        # No Lustre on bender: everything goes below the repo, into sela_data/
+        # (git-ignored). Empty = <repo>/sela_data, resolved once the repo is found.
+        SELA_ROOT="${SELA_ROOT:-}"
+        # A40 nodes: Intel Xeon, 48 GB. A100 nodes: AMD EPYC, with their own
+        # module tree (AMD_MODULEPATH). A venv only runs on the CPU family it
+        # was built on, so env build, downloads and shards all use one family,
+        # each family with its own venv.
+        BENDER_GPU=A40                  # A40 | A100
+        GPU_PARTITION="${BENDER_GPU}short"      # 8h
+        ENV_PARTITION="${BENDER_GPU}devel"      # 1h
+        DOWNLOAD_PARTITION="${BENDER_GPU}short"
+        SMOKE_PARTITION="${BENDER_GPU}devel"
+        GPU_MEM=48G
+        GPU_SCALE=1; [ "$BENDER_GPU" = A40 ] && GPU_SCALE=0.5   # 48 GB, ~2x slower than an A100
+        ENV_NAME="env_${BENDER_GPU,,}"          # env_a40 | env_a100
+        AMD_MODULEPATH="/software/easybuild-AMD_A100/modules/all"
+        # bender's driver is only known to run Disentangling-Reasoning's
+        # torch 2.6 (CUDA 12.4) -- take the closest CUDA build of TORCH_VERSION.
+        TORCH_INDEX_URL="https://download.pytorch.org/whl/cu126"
+        SYS_PYTHON=python3              # < 3.8: PYTHON_MODULE is loaded instead (sys_python)
+        REPORT_FILE=selar_report_bender.md
+        ;;
+    *) echo "ERROR: unknown SELA_SERVER '$SERVER' (marvin | bender)" >&2; exit 1 ;;
+esac
 GPU_TIME=08:00:00
-GPU_MEM=64G
 GPU_GRES=gpu:1
 GPU_EXTRA_SBATCH=()             # e.g. (--qos=... --constraint=...)
-ENV_PARTITION=sgpu_devel        # --setup-env (needs an AMD GPU node; ~3 min)
-DOWNLOAD_PARTITION=sgpu_short   # --download (CPU only, 32G)
-# Problems per GPU job (shard) and per forward batch. A shard should fit in
+# Problems per GPU job (shard) and per forward batch, sized for one 80 GB
+# A100; GPU_SCALE (profile above) scales both. A shard should fit in
 # GPU_TIME (a killed shard resumes, but loses its unfinished batch); a batch
 # that runs out of memory is retried at half size by the worker.
 declare -A SHARD_SIZE=([gsm8k]=330 [math500]=125 [gpqa_diamond]=99 [aime_2024]=30 [aime_2025]=30)
@@ -232,14 +287,11 @@ SUBMIT_TIMEOUT=300              # give up on one sbatch call after this long (re
 AUTO_REPORT=1                   # run reporting.sh after every pass
 EXIT_WHEN_DONE=0                # 1: stop (no re-init) once every planned run is merged;
                                 # 0: keep checking hourly, e.g. for SELECTION edits
-WS_WARN_DAYS=10                 # warn when the Lustre workspace expires sooner
+WS_WARN_DAYS=10                 # warn when the Lustre workspace expires sooner (marvin)
 
-# Python on marvin's GPU nodes (AMD EPYC): the AMD EasyBuild tree, AVX2 only.
+# Python for the venv: this module (AMD_MODULEPATH first on AMD nodes, AVX2 only).
 PYTHON_MODULE="Python/3.11.3-GCCcore-12.3.0"
-AMD_MODULEPATH="/opt/software/easybuild-AMD/modules/all"
 TORCH_VERSION=2.7.0
-TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128"
-SYS_PYTHON=/usr/bin/python3     # stdlib-only helpers (merge, status) in this CPU job
 
 # Slurm account whose queue we inspect (defaults to whoever runs the script).
 SLURM_USER="${SLURM_USER:-$(id -un)}"
@@ -268,11 +320,21 @@ apply_smoke() {
     for d in "${!MAX_NEW_TOKENS[@]}"; do
         MAX_NEW_TOKENS[$d]=512; SHARD_SIZE[$d]=4; BATCH_SIZE[$d]=4
     done
-    GPU_PARTITION=sgpu_devel
+    GPU_PARTITION="$SMOKE_PARTITION"
     GPU_TIME=00:30:00
     AUTO_REPORT=0
     EXIT_WHEN_DONE=1
     CHECK_INTERVAL=300
+}
+
+# GPU_SCALE: proportionally smaller batches (and shards) on smaller GPUs
+apply_gpu_scale() {
+    local d
+    [ "$GPU_SCALE" = 1 ] && return 0
+    for d in "${!BATCH_SIZE[@]}"; do
+        BATCH_SIZE[$d]=$(awk -v x="${BATCH_SIZE[$d]}" -v s="$GPU_SCALE" 'BEGIN { v = int(x * s + 0.5); print (v < 1) ? 1 : v }')
+        SHARD_SIZE[$d]=$(awk -v x="${SHARD_SIZE[$d]}" -v s="$GPU_SCALE" 'BEGIN { v = int(x * s + 0.5); print (v < 1) ? 1 : v }')
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -362,15 +424,16 @@ while [ $# -gt 0 ]; do
             MODE=worker; WORKER_ATTEMPTS="${2:?--worker needs an attempts file}"; shift 2
             [ "${1:-}" = "--" ] && shift
             WORKER_ARGS=("$@"); break ;;
-        -h|--help) sed -n '/^# =====/,/^# =====/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '/^# =====/,/^# =====/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
     shift
 done
+apply_gpu_scale
 [ "$SMOKE" -eq 1 ] && apply_smoke
 
 # ---------------------------------------------------------------------------
-# Repo root + storage (all on Lustre) + logging + journal
+# Repo root + storage ($SELA_ROOT) + logging + journal
 # ---------------------------------------------------------------------------
 find_repo_root() {
     local dir="$1"
@@ -384,7 +447,8 @@ find_repo_root() {
 # no longer points at the repo once submitted -- prefer SLURM_SUBMIT_DIR (the
 # dir where `sbatch` was invoked), exactly like heart_beat.sh; if that is not
 # inside the repo, the path the job was submitted with (scontrol "Command=").
-START_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+# A server wrapper (Sela_beat_bender.sh) has found the repo already: SELA_REPO.
+START_DIR="${SELA_REPO:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}}"
 REPO_ROOT="$(find_repo_root "$START_DIR")"
 if [ -z "${REPO_ROOT:-}" ] && [ -n "${SLURM_JOB_ID:-}" ]; then
     submitted="$(scontrol show job "$SLURM_JOB_ID" 2>/dev/null | grep -oE 'Command=[^ ]+' | cut -d= -f2)"
@@ -395,9 +459,17 @@ if [ -z "${REPO_ROOT:-}" ] || [ ! -f "$REPO_ROOT/scripts/sela_run.py" ]; then
     exit 1
 fi
 cd "$REPO_ROOT" || exit 1
-SELF="$REPO_ROOT/Sela_beat.sh"
+ENGINE="$REPO_ROOT/Sela_beat.sh"
+# SELF is what every job this script submits runs (shards, prerequisites, the
+# 24h re-init): the server's entry point, so it keeps that server's #SBATCH header.
+case "$SERVER" in
+    bender) SELF="$REPO_ROOT/Sela_beat_bender.sh"
+            [ -n "$SELA_ROOT" ] || SELA_ROOT="$REPO_ROOT/sela_data" ;;
+    *)      SELF="$ENGINE" ;;
+esac
+[ -f "$SELF" ] || { echo "ERROR: $SELF not found" >&2; exit 1; }
 
-ENV_DIR="$SELA_ROOT/env"
+ENV_DIR="$SELA_ROOT/$ENV_NAME"
 ENV_FLAG=".selar_env_complete"
 MODEL_STORE="$SELA_ROOT/models"
 CACHE_DIR="$SELA_ROOT/cache"
@@ -423,11 +495,19 @@ log() {
 # ---------------------------------------------------------------------------
 # Job modes -- what the Slurm jobs submitted by this script run
 # ---------------------------------------------------------------------------
-# Python on a marvin GPU node: the AMD EasyBuild tree must come first in
-# MODULEPATH (Intel-tree modules die with SIGILL on AMD EPYC), and MKL/oneDNN
-# are capped at AVX2 -- see Disentangling-Reasoning/script/model_resources.sh.
+# Python on an AMD EPYC node (every marvin GPU node, bender's A100 nodes): the
+# server's AMD EasyBuild tree must come first in MODULEPATH (Intel-tree modules
+# die with SIGILL on AMD EPYC), and MKL/oneDNN are capped at AVX2 -- see
+# Disentangling-Reasoning/script/model_resources.sh. Intel nodes (bender's
+# A40s) use the default tree as it is.
 load_python_module() {
-    type module >/dev/null 2>&1 || source /etc/profile.d/modules.sh
+    local f
+    if ! type module >/dev/null 2>&1; then
+        for f in /etc/profile.d/modules.sh /etc/profile.d/lmod.sh /usr/share/lmod/lmod/init/bash; do
+            # shellcheck disable=SC1090
+            [ -f "$f" ] && { source "$f"; break; }
+        done
+    fi
     if grep -q AuthenticAMD /proc/cpuinfo 2>/dev/null; then
         case ":${MODULEPATH:-}:" in
             *":$AMD_MODULEPATH:"*) ;;
@@ -444,7 +524,18 @@ activate_env() {
     export MKL_ENABLE_INSTRUCTIONS=AVX2 DNNL_MAX_CPU_ISA=AVX2
 }
 
-# Every cache onto Lustre, so nothing grows in the (small) home directory.
+# The stdlib-only helpers (merge, status) need python >= 3.8. A system python3
+# that is older gets PYTHON_MODULE, loaded in a subshell so nothing of it
+# leaks into the jobs this script submits.
+sys_python() {
+    if "$SYS_PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 8))' 2>/dev/null; then
+        "$SYS_PYTHON" "$@"
+    else
+        ( load_python_module >/dev/null 2>&1 && exec python3 "$@" )
+    fi
+}
+
+# Every cache into $SELA_ROOT, so nothing grows in the (small) home directory.
 export_caches() {
     export HF_HOME="$HF_HOME_DIR" PIP_CACHE_DIR="$CACHE_DIR/pip" XDG_CACHE_HOME="$CACHE_DIR/xdg" \
            TRITON_CACHE_DIR="$CACHE_DIR/triton" TORCHINDUCTOR_CACHE_DIR="$CACHE_DIR/inductor" \
@@ -468,13 +559,13 @@ stalled_attempts() {   # $1 attempts file, $2 current progress -> trailing attem
 
 job_banner() {
     echo "======================================================================"
-    echo " Sela_beat.sh $1 -- job ${SLURM_JOB_ID:-manual} -- $(date +'%F %T')"
+    echo " Sela_beat.sh $1 -- $SERVER job ${SLURM_JOB_ID:-manual} on $(hostname) -- $(date +'%F %T')"
     echo "======================================================================"
 }
 
 setup_env_main() {
     job_banner "--setup-env"
-    record_attempt "$STATE_DIR/env.attempts" 0
+    record_attempt "$STATE_DIR/$ENV_NAME.attempts" 0
     export_caches
     load_python_module || { echo "ERROR: module load $PYTHON_MODULE failed"; return 1; }
     echo "python: $(command -v python3) ($(python3 --version 2>&1))"
@@ -497,7 +588,8 @@ print("torch", torch.__version__, "| cuda", torch.version.cuda, "| gpu", torch.c
 print("transformers", transformers.__version__, "| datasets", datasets.__version__)
 assert torch.cuda.is_available(), "no GPU visible -- --setup-env must run on a GPU node"
 x = torch.randn(512, 512, device="cuda")
-print("cuda matmul ok:", torch.isfinite(x @ x).all().item(), "on", torch.cuda.get_device_name(0))
+print("cuda matmul ok:", torch.isfinite(x @ x).all().item(), "on", torch.cuda.get_device_name(0),
+      "%.0f GiB" % (torch.cuda.get_device_properties(0).total_memory / 2**30))
 PY
     date +'%F %T' > "$ENV_DIR/$ENV_FLAG"
     echo "env ready: $ENV_DIR"
@@ -943,7 +1035,7 @@ ensure_prereq() {
 ensure_env() {
     local ready=0
     [ -f "$ENV_DIR/$ENV_FLAG" ] && ready=1
-    ensure_prereq "env::setup" "sx_setup_env" "$ready" "$STATE_DIR/env.attempts" \
+    ensure_prereq "env::setup" "sx_setup_env" "$ready" "$STATE_DIR/$ENV_NAME.attempts" \
         --partition="$ENV_PARTITION" --time=01:00:00 --mem=32G --gres="$GPU_GRES" \
         "$SELF" --setup-env
 }
@@ -1078,7 +1170,7 @@ run_pass() {
         fi
         if [ "$DRY_RUN" -eq 1 ] || [ "$STATUS_ONLY" -eq 1 ]; then
             log "WOULD MERGE ${run_dir#"$RUNS_DIR"/}"
-        elif "$SYS_PYTHON" -B "$REPO_ROOT/scripts/sela_tools.py" merge --run_dir "$run_dir" \
+        elif sys_python -B "$REPO_ROOT/scripts/sela_tools.py" merge --run_dir "$run_dir" \
                 --num_shards "$n_shards" >> "$BEAT_LOG" 2>&1; then
             n_merged=$((n_merged + 1)); n_up_to_date=$((n_up_to_date + 1))
             journal_append MERGED "run::${run_dir#"$RUNS_DIR"/}"
@@ -1107,7 +1199,7 @@ run_pass() {
     status_out="$STATUS_FILE"
     [ "$DRY_RUN" -eq 1 ] && status_out="$(mktemp)"
     [ "$DRY_RUN" -eq 1 ] || mkdir -p "$TREE"
-    if "$SYS_PYTHON" -B "$REPO_ROOT/scripts/sela_tools.py" status --plan "$status_tsv" \
+    if sys_python -B "$REPO_ROOT/scripts/sela_tools.py" status --plan "$status_tsv" \
             --out "$status_out" --interval "$(( CHECK_INTERVAL / 60 ))" 2>>"$err_log"; then
         if [ "$ONCE" -eq 1 ]; then cat "$status_out"; fi
         [ "$DRY_RUN" -eq 1 ] || log "status -> $status_out"
@@ -1117,8 +1209,9 @@ run_pass() {
 
     # 4) the report
     if [ "$AUTO_REPORT" -eq 1 ] && [ "$DRY_RUN" -eq 0 ] && [ "$STATUS_ONLY" -eq 0 ]; then
-        SELA_ROOT="$SELA_ROOT" bash "$REPO_ROOT/reporting.sh" >> "$BEAT_LOG" 2>&1 \
-            && log "report -> $REPO_ROOT/result/selar_report.md" \
+        SELA_SERVER="$SERVER" SELA_ROOT="$SELA_ROOT" SELA_REPO="$REPO_ROOT" \
+            bash "$REPO_ROOT/reporting.sh" >> "$BEAT_LOG" 2>&1 \
+            && log "report -> $REPO_ROOT/result/$REPORT_FILE" \
             || log "WARNING: reporting.sh failed (see $LOG_DIR/reporting.log)"
     fi
     log "===== Sela_beat pass end ====="
@@ -1161,7 +1254,7 @@ for a in ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}; do
 done
 
 # One line per (re-)initialization recording the config this instance runs with.
-log "INIT Sela_beat job=${SLURM_JOB_ID:-standalone} root=$SELA_ROOT tree=$TREE phases=(${PHASES[*]}) methods=(${METHODS[*]}) combos=(${COMBOS[*]}) models=(${MODELS[*]}) datasets=(${DATASETS[*]}) seeds=(${SEEDS[*]}) n=$N_SAMPLES sweep=(${SWEEP_METHODS[*]}|${SWEEP_DATASETS[*]}|n=$SWEEP_N_SAMPLES|$SWEEP_MODE) preset=$SELAR_PRESET partition=$GPU_PARTITION interval=${CHECK_INTERVAL}s reinit_at=${REINIT_AT}s once=$ONCE dry_run=$DRY_RUN status_only=$STATUS_ONLY"
+log "INIT Sela_beat server=$SERVER job=${SLURM_JOB_ID:-standalone} root=$SELA_ROOT tree=$TREE phases=(${PHASES[*]}) methods=(${METHODS[*]}) combos=(${COMBOS[*]}) models=(${MODELS[*]}) datasets=(${DATASETS[*]}) seeds=(${SEEDS[*]}) n=$N_SAMPLES sweep=(${SWEEP_METHODS[*]}|${SWEEP_DATASETS[*]}|n=$SWEEP_N_SAMPLES|$SWEEP_MODE) preset=$SELAR_PRESET partition=$GPU_PARTITION interval=${CHECK_INTERVAL}s reinit_at=${REINIT_AT}s once=$ONCE dry_run=$DRY_RUN status_only=$STATUS_ONLY"
 
 reinitialize() {
     # Hand off to a fresh instance before the wall clock ("initialize itself
@@ -1178,18 +1271,24 @@ reinitialize() {
     fi
 }
 
-# Under Slurm this job runs the copy of the script made at submission time.
-# When Sela_beat.sh in the repo has been edited since (e.g. its SELECTION),
-# hand over to a fresh job running the new version -- if that validates.
+# Under Slurm this job runs the copy of the script made at submission time
+# ($0) -- and, started via a server wrapper (Sela_beat_bender.sh), the
+# Sela_beat.sh it sourced at start-up (bash reads a sourced file whole).
+# When either has been edited in the repo since (e.g. the SELECTION), hand
+# over to a fresh job running the new version -- if that validates.
+code_sum() { cat "$@" 2>/dev/null | md5sum | cut -c1-32; }
+if [ "${BASH_SOURCE[0]}" -ef "$0" ]; then RUN_CODE=("$0"); LIVE_CODE=("$SELF")
+else RUN_CODE=("$0" "$ENGINE"); LIVE_CODE=("$SELF" "$ENGINE"); fi
+RUN_SUM="$(code_sum "${RUN_CODE[@]}")"
 edited_and_valid() {
     [ -n "${SLURM_JOB_ID:-}" ] || return 1
-    cmp -s "$0" "$SELF" && return 1
-    if bash -n "$SELF" 2>>"$BEAT_LOG" && \
+    [ "$(code_sum "${LIVE_CODE[@]}")" = "$RUN_SUM" ] && return 1
+    if bash -n "$SELF" 2>>"$BEAT_LOG" && bash -n "$ENGINE" 2>>"$BEAT_LOG" && \
        SELA_ROOT="$SELA_ROOT" bash "$SELF" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"} --plan >/dev/null 2>>"$BEAT_LOG"; then
-        log "Sela_beat.sh was edited -> handing over to a fresh job running the new version."
+        log "$(basename "$SELF") was edited -> handing over to a fresh job running the new version."
         return 0
     fi
-    log "WARNING: Sela_beat.sh was edited but does not validate (see $BEAT_LOG) -- keeping the running version."
+    log "WARNING: $(basename "$SELF") was edited but does not validate (see $BEAT_LOG) -- keeping the running version."
     return 1
 }
 

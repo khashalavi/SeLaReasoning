@@ -24,7 +24,9 @@ Every GPU node has AMD EPYC 7713 CPUs. A GPU job gets 32 CPU cores by default
 (`DefCpuPerGPU=32`). The `medium` and `long` QoS caps a user at 48 GPUs.
 `sgpu_devel` ran two of the smoke test's jobs at a time.
 
-To use the A40 nodes: `GPU_PARTITION=mlgpu_short` and halve `BATCH_SIZE`.
+To use the A40 nodes: `GPU_PARTITION=mlgpu_short` and `GPU_SCALE=0.5` (halves
+`BATCH_SIZE` and `SHARD_SIZE`). These tables are marvin's; for bender's
+partitions see [Running on bender](bender.md).
 
 ## Shards and batches
 

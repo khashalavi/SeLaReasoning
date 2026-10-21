@@ -7,3 +7,6 @@ __pycache__/
 
 # the built documentation (zensical build)
 site/
+
+# bender has no Lustre: Sela_beat_bender.sh keeps env, models, caches, runs and logs here
+sela_data/
