@@ -1,0 +1,24 @@
+# Cluster environment for the TF5_MODELS of Sela_beat.sh (built by
+# `Sela_beat.sh --setup-env tf5` into $SELA_ROOT/env_tf5*, alongside
+# requirements-sela.txt's env). Same stack as requirements-sela.txt -- except
+# transformers 5: the qwen3_5 model type (Qwen3.5, 2026) does not exist in
+# transformers 4.51, which the generation loops pin for its DynamicCache API.
+#
+# transformers is pinned; tokenizers / huggingface_hub / hf-xet / safetensors /
+# accelerate float to whatever transformers 5 needs (they move together and are
+# frozen here once tests/test_selarx.py passes in the built env).
+transformers==5.20.2
+accelerate
+datasets==4.4.1
+numpy==2.4.6
+pyarrow==26.0.0
+sympy==1.14.0
+math-verify[antlr4_13_2]==0.9.0
+latex2sympy2_extended==1.11.0
+tqdm==4.70.1
+
+# Qwen3.5 is hybrid (Gated DeltaNet linear attention in 3 of 4 layers): without
+# this, transformers falls back to a much slower pure-PyTorch recurrence. Pure
+# Python on Triton (already shipped with torch), no compilation. (causal-conv1d,
+# the other fast path, needs nvcc to build and is skipped: minor cost.)
+flash-linear-attention

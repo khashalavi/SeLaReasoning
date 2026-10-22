@@ -26,7 +26,11 @@
 #   cluster keeps its own $SELA_ROOT tree and report.
 #
 # EVERYTHING IS WRITTEN TO $SELA_ROOT (marvin: Lustre), NEVER INTO THE REPO:
-#   env/                 Python venv (torch + requirements-sela.txt), built once
+#   env*/                Python venvs (torch + requirements-sela.txt or
+#                        requirements-sela-tf5.txt), built once per CPU family
+#                        and transformers major: the default env (env, env_a40,
+#                        env_a100) and a transformers 5 one (env_tf5*) for the
+#                        models in TF5_MODELS below (qwen3_5, e.g. Qwen3.5)
 #   models/<org>/<name>  model weights, downloaded once (.download_complete marker)
 #   hf_home/ cache/      HF hub / pip / triton / pycache caches
 #   runs/<model>/<dataset>/n<N>/<config>/<decoding>/seed<S>/
@@ -44,10 +48,11 @@
 #
 # WHAT ONE PASS DOES (every CHECK_INTERVAL, default 1h):
 #   0. prerequisites, each its own Slurm job, submitted once and tracked like
-#      everything else:  env not built -> --setup-env job (on the node type
-#      the shards use: a venv only runs on the CPU family it was built for,
-#      see load_python_module);  model not in models/ -> --download job per model.
-#      Shards of a model wait until both are ready.
+#      everything else:  a model's env not built -> --setup-env job per env (the
+#      transformers 5 env for TF5_MODELS, the default otherwise; on the node
+#      type the shards use: a venv only runs on the CPU family it was built
+#      for, see load_python_module);  model not in models/ -> --download job
+#      per model.  Shards of a model wait until both are ready.
 #   1. expand SELECTION -> runs -> shards (= GPU jobs), write plan.tsv
 #   2. for every shard:
 #        FINISHED  if shards/shard_<i>of<n>.json exists
@@ -62,7 +67,7 @@
 # JOURNAL FORMAT (append-only, one line per event):
 #   <timestamp> | <EVENT> | <key> | job=<id>
 #   key:   shard::<run dir below runs/>::<i>of<n> | run::<run dir below runs/>
-#          | env::setup | download::<model>
+#          | env::setup | env::setup::tf5 | download::<model>
 #   EVENT: SUBMITTED RUNNING FINISHED DIED ADOPTED SUBMIT_FAILED GAVE_UP MERGED
 #          RESET <slurm-state>
 #
@@ -89,7 +94,7 @@
 #                     (report: ./reporting.sh --smoke)
 #     --retry-failed  reset the stall counters of GAVE_UP shards / jobs
 #   Internal -- the jobs this script submits run the script itself as:
-#     --setup-env | --download MODEL | --worker ATTEMPTS_FILE -- <sela_run.py args>
+#     --setup-env [base|tf5|all] | --download MODEL | --worker ATTEMPTS_FILE -- <sela_run.py args>
 # ============================================================================
 
 set -uo pipefail
@@ -134,6 +139,13 @@ MODELS=(
     # "Qwen/Qwen3-1.7B"
     # "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"     # less calibrated (Idea 2)
 )
+# Models that run in the transformers 5 env: their model type (qwen3_5) does
+# not exist in transformers 4.51, which the generation loops pin for its
+# DynamicCache API. Their env, download and shard jobs use
+# requirements-sela-tf5.txt's venv (env_tf5*); every other model uses the
+# default env. One exact HF id per entry -- a model must also be in MODELS /
+# SWEEP_MODELS to be run at all.
+TF5_MODELS=("Qwen/Qwen3.5-2B")
 DATASETS=(gsm8k math500 aime_2024 aime_2025 gpqa_diamond)
 SEEDS=(41)              # several seeds -> mean +- std in the report (AIME: 30 problems,
                         # one problem = 3.33 points, a single seed is very noisy)
@@ -240,6 +252,7 @@ case "$SERVER" in
         GPU_MEM=64G
         GPU_SCALE=1                     # factor on BATCH_SIZE and SHARD_SIZE below
         ENV_NAME=env                    # the venv: $SELA_ROOT/$ENV_NAME
+        ENV_NAME_TF5=env_tf5            # the transformers 5 venv (TF5_MODELS)
         # Every marvin GPU node is AMD EPYC: Python from the AMD EasyBuild tree.
         AMD_MODULEPATH="/opt/software/easybuild-AMD/modules/all"
         TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128"
@@ -262,6 +275,7 @@ case "$SERVER" in
         GPU_MEM=48G
         GPU_SCALE=1; [ "$BENDER_GPU" = A40 ] && GPU_SCALE=0.5   # 48 GB, ~2x slower than an A100
         ENV_NAME="env_${BENDER_GPU,,}"          # env_a40 | env_a100
+        ENV_NAME_TF5="env_tf5_${BENDER_GPU,,}"  # env_tf5_a40 | env_tf5_a100
         AMD_MODULEPATH="/software/easybuild-AMD_A100/modules/all"
         # bender's driver is only known to run Disentangling-Reasoning's
         # torch 2.6 (CUDA 12.4) -- take the closest CUDA build of TORCH_VERSION.
@@ -274,6 +288,8 @@ esac
 GPU_TIME=08:00:00
 GPU_GRES=gpu:1
 GPU_EXTRA_SBATCH=()             # e.g. (--qos=... --constraint=...)
+# node-02 has a GPU with uncorrectable ECC errors (shards die loading the model): keep off it
+[ "$SERVER" = bender ] && GPU_EXTRA_SBATCH=(--exclude="${BENDER_EXCLUDE_NODES:-node-02}")
 # Problems per GPU job (shard) and per forward batch, sized for one 80 GB
 # A100; GPU_SCALE (profile above) scales both. A shard should fit in
 # GPU_TIME (a killed shard resumes, but loses its unfinished batch); a batch
@@ -282,6 +298,7 @@ declare -A SHARD_SIZE=([gsm8k]=330 [math500]=125 [gpqa_diamond]=99 [aime_2024]=3
 declare -A BATCH_SIZE=([gsm8k]=48 [math500]=32 [gpqa_diamond]=24 [aime_2024]=15 [aime_2025]=15)
 MAX_STALLED=3                   # attempts in a row without progress -> GAVE_UP
 MAX_SUBMIT_PER_PASS=150         # cap on new GPU jobs per pass (the rest wait an hour)
+MAX_ACTIVE_JOBS=10               # cap on shard jobs running + pending at once (the rest wait for a later pass)
 SUBMIT_PAUSE=1                  # seconds between sbatch calls: slurmctld rate-limits bursts
 SUBMIT_TIMEOUT=300              # give up on one sbatch call after this long (retried next pass)
 AUTO_REPORT=1                   # run reporting.sh after every pass
@@ -298,7 +315,7 @@ SLURM_USER="${SLURM_USER:-$(id -un)}"
 
 # How often to re-check (seconds). 3600 = every hour; PREREQ_INTERVAL while the
 # env build / a model download is still pending, so the shards go out soon after.
-CHECK_INTERVAL="${CHECK_INTERVAL:-3600}"
+CHECK_INTERVAL="${CHECK_INTERVAL:-600}"
 PREREQ_INTERVAL="${PREREQ_INTERVAL:-600}"
 
 # The job runs for ~24h (see #SBATCH --time), then re-initializes itself a few
@@ -312,7 +329,7 @@ apply_smoke() {
     PHASES=(main)
     METHODS=(cot cot_greedy selar selar_upstream cot_upstream swir layer sem ltr fhg dynk)
     COMBOS=("sem+dynk" "layer+ltr")
-    MODELS=("Qwen/Qwen3-0.6B")
+    MODELS=("${SMOKE_MODEL:-Qwen/Qwen3-0.6B}")
     DATASETS=(gsm8k)
     SEEDS=(41)
     N_SAMPLES=4
@@ -324,7 +341,7 @@ apply_smoke() {
     GPU_TIME=00:30:00
     AUTO_REPORT=0
     EXIT_WHEN_DONE=1
-    CHECK_INTERVAL=300
+    CHECK_INTERVAL=120
 }
 
 # GPU_SCALE: proportionally smaller batches (and shards) on smaller GPUs
@@ -408,7 +425,7 @@ selar_preset() {   # $1 model $2 dataset -> "k tau" (empty: no preset)
 # ---------------------------------------------------------------------------
 ORIG_ARGS=("$@")
 MODE=beat; ONCE=0; DRY_RUN=0; STATUS_ONLY=0; PLAN_ONLY=0; SMOKE=0; RETRY_FAILED=0
-DOWNLOAD_MODEL=""; WORKER_ATTEMPTS=""; WORKER_ARGS=()
+DOWNLOAD_MODEL=""; WORKER_ATTEMPTS=""; WORKER_ARGS=(); ENV_TARGET=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --once)         ONCE=1 ;;
@@ -418,7 +435,9 @@ while [ $# -gt 0 ]; do
         --plan-tsv)     PLAN_ONLY=2 ;;
         --smoke)        SMOKE=1 ;;
         --retry-failed) RETRY_FAILED=1 ;;
-        --setup-env)    MODE=setup_env ;;
+        --setup-env)
+            MODE=setup_env
+            case "${2:-}" in base|tf5|all) ENV_TARGET="$2"; shift ;; esac ;;
         --download)     MODE=download; DOWNLOAD_MODEL="${2:?--download needs a model id}"; shift ;;
         --worker)
             MODE=worker; WORKER_ATTEMPTS="${2:?--worker needs an attempts file}"; shift 2
@@ -470,7 +489,22 @@ esac
 [ -f "$SELF" ] || { echo "ERROR: $SELF not found" >&2; exit 1; }
 
 ENV_DIR="$SELA_ROOT/$ENV_NAME"
+ENV_DIR_TF5="$SELA_ROOT/$ENV_NAME_TF5"
 ENV_FLAG=".selar_env_complete"
+
+# Which env a model runs in: transformers 5 for TF5_MODELS, the default
+# otherwise. Self-contained on purpose -- the job modes below call these before
+# the beat's own helper functions (in_list) are defined.
+env_target_for_model() {
+    local m
+    for m in ${TF5_MODELS[@]+"${TF5_MODELS[@]}"}; do
+        [ "$m" = "$1" ] && { echo tf5; return 0; }
+    done
+    echo base
+}
+env_dir_for_model() {
+    [ "$(env_target_for_model "$1")" = tf5 ] && echo "$ENV_DIR_TF5" || echo "$ENV_DIR"
+}
 MODEL_STORE="$SELA_ROOT/models"
 CACHE_DIR="$SELA_ROOT/cache"
 HF_HOME_DIR="$SELA_ROOT/hf_home"
@@ -517,10 +551,11 @@ load_python_module() {
     module load "$PYTHON_MODULE"
 }
 
-activate_env() {
+activate_env() {   # $1: env dir (default: the default env)
+    local dir="${1:-$ENV_DIR}"
     load_python_module || return 1
     # shellcheck disable=SC1091
-    source "$ENV_DIR/bin/activate" || return 1
+    source "$dir/bin/activate" || return 1
     export MKL_ENABLE_INSTRUCTIONS=AVX2 DNNL_MAX_CPU_ISA=AVX2
 }
 
@@ -563,46 +598,72 @@ job_banner() {
     echo "======================================================================"
 }
 
-setup_env_main() {
-    job_banner "--setup-env"
-    record_attempt "$STATE_DIR/$ENV_NAME.attempts" 0
-    export_caches
-    load_python_module || { echo "ERROR: module load $PYTHON_MODULE failed"; return 1; }
-    echo "python: $(command -v python3) ($(python3 --version 2>&1))"
-    if [ -d "$ENV_DIR" ] && [ ! -f "$ENV_DIR/$ENV_FLAG" ]; then
-        case "$ENV_DIR" in
-            "$SELA_ROOT"/*) echo "removing incomplete env $ENV_DIR"; rm -rf "$ENV_DIR" ;;
-            *) echo "ERROR: refusing to remove $ENV_DIR (outside $SELA_ROOT)"; return 1 ;;
+# One venv per (CPU family, transformers major): base = requirements-sela.txt
+# (transformers 4.51, the DynamicCache API of the generation loops), tf5 =
+# requirements-sela-tf5.txt (transformers 5, the qwen3_5 model type).
+build_env() {   # $1 target: base | tf5
+    local target="$1" name dir req
+    if [ "$target" = tf5 ]; then
+        name="$ENV_NAME_TF5"; dir="$ENV_DIR_TF5"; req="$REPO_ROOT/requirements-sela-tf5.txt"
+    else
+        name="$ENV_NAME"; dir="$ENV_DIR"; req="$REPO_ROOT/requirements-sela.txt"
+    fi
+    record_attempt "$STATE_DIR/$name.attempts" 0
+    type deactivate >/dev/null 2>&1 && deactivate
+    if [ -d "$dir" ] && [ ! -f "$dir/$ENV_FLAG" ]; then
+        case "$dir" in
+            "$SELA_ROOT"/*) echo "removing incomplete env $dir"; rm -rf "$dir" ;;
+            *) echo "ERROR: refusing to remove $dir (outside $SELA_ROOT)"; return 1 ;;
         esac
     fi
-    python3 -m venv "$ENV_DIR" || return 1
+    python3 -m venv "$dir" || return 1
     # shellcheck disable=SC1091
-    source "$ENV_DIR/bin/activate" || return 1
+    source "$dir/bin/activate" || return 1
     export MKL_ENABLE_INSTRUCTIONS=AVX2 DNNL_MAX_CPU_ISA=AVX2
     python -m pip install --upgrade pip || return 1
     python -m pip install "torch==$TORCH_VERSION" --index-url "$TORCH_INDEX_URL" || return 1
-    python -m pip install -r "$REPO_ROOT/requirements-sela.txt" || return 1
-    python - <<'PY' || return 1
+    python -m pip install -r "$req" || return 1
+    SELA_ENV_TARGET="$target" python - <<'PY' || return 1
+import os
 import torch, transformers, datasets, math_verify, latex2sympy2_extended  # noqa: F401
 print("torch", torch.__version__, "| cuda", torch.version.cuda, "| gpu", torch.cuda.is_available())
 print("transformers", transformers.__version__, "| datasets", datasets.__version__)
+if os.environ["SELA_ENV_TARGET"] == "tf5":
+    # KeyError here = this transformers cannot load the TF5_MODELS at all
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    CONFIG_MAPPING["qwen3_5"]
+    print("qwen3_5 model type registered: ok")
 assert torch.cuda.is_available(), "no GPU visible -- --setup-env must run on a GPU node"
 x = torch.randn(512, 512, device="cuda")
 print("cuda matmul ok:", torch.isfinite(x @ x).all().item(), "on", torch.cuda.get_device_name(0),
       "%.0f GiB" % (torch.cuda.get_device_properties(0).total_memory / 2**30))
 PY
-    date +'%F %T' > "$ENV_DIR/$ENV_FLAG"
-    echo "env ready: $ENV_DIR"
+    date +'%F %T' > "$dir/$ENV_FLAG"
+    echo "env ready: $dir"
+}
+
+setup_env_main() {
+    job_banner "--setup-env ${ENV_TARGET:-all}"
+    export_caches
+    load_python_module || { echo "ERROR: module load $PYTHON_MODULE failed"; return 1; }
+    echo "python: $(command -v python3) ($(python3 --version 2>&1))"
+    if [ "${ENV_TARGET:-all}" != tf5 ]; then
+        build_env base || return 1
+    fi
+    if [ "${ENV_TARGET:-all}" != base ]; then
+        build_env tf5 || return 1
+    fi
 }
 
 # Same file selection as Disentangling-Reasoning/script/download_model.sh.
 download_main() {
-    local model="$1" dest="$MODEL_STORE/$1"
+    local model="$1" dest="$MODEL_STORE/$1" env_dir
     job_banner "--download $model"
     record_attempt "$STATE_DIR/download_$(model_tag "$model").attempts" 0
     [ -f "$dest/.download_complete" ] && { echo "ready: $dest"; return 0; }
     export_caches
-    activate_env || { echo "ERROR: could not activate $ENV_DIR"; return 1; }
+    env_dir="$(env_dir_for_model "$model")"
+    activate_env "$env_dir" || { echo "ERROR: could not activate $env_dir"; return 1; }
     mkdir -p "$dest"
     MODEL="$model" DEST="$dest" python - <<'PY' || return 1
 import os
@@ -621,13 +682,20 @@ PY
 }
 
 worker_main() {
-    local partial="${WORKER_ATTEMPTS%.attempts}.partial.jsonl" done=0 left=""
+    local partial="${WORKER_ATTEMPTS%.attempts}.partial.jsonl" done=0 left="" env_dir
+    local model="" prev="" a
+    for a in ${WORKER_ARGS[@]+"${WORKER_ARGS[@]}"}; do
+        [ "$prev" = "--model_name" ] && { model="$a"; break; }
+        prev="$a"
+    done
     [ -f "$partial" ] && done=$(wc -l < "$partial")
     record_attempt "$WORKER_ATTEMPTS" "$done"     # first, so even a broken env counts
     job_banner "--worker"
     export_caches
     export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
-    activate_env || { echo "ERROR: could not activate $ENV_DIR"; return 1; }
+    env_dir="$(env_dir_for_model "$model")"
+    activate_env "$env_dir" || { echo "ERROR: could not activate $env_dir"; return 1; }
+    echo "model: ${model:--}   env: $env_dir"
     [ -n "${SLURM_JOB_ID:-}" ] && left="$(squeue -h -j "$SLURM_JOB_ID" -o %L 2>/dev/null)"
     echo "time left: ${left:-unknown}   resuming from $done finished problems"
     python -u "$REPO_ROOT/scripts/sela_run.py" "${WORKER_ARGS[@]}" ${left:+--time_left "$left"}
@@ -1032,12 +1100,18 @@ ensure_prereq() {
     return 1
 }
 
+# ensure_env base|tf5 -- the venv prerequisite of the models of that target
 ensure_env() {
-    local ready=0
-    [ -f "$ENV_DIR/$ENV_FLAG" ] && ready=1
-    ensure_prereq "env::setup" "sx_setup_env" "$ready" "$STATE_DIR/$ENV_NAME.attempts" \
+    local target="$1" name dir key job ready=0
+    if [ "$target" = tf5 ]; then
+        name="$ENV_NAME_TF5"; dir="$ENV_DIR_TF5"; key="env::setup::tf5"; job="sx_setup_env_tf5"
+    else
+        name="$ENV_NAME"; dir="$ENV_DIR"; key="env::setup"; job="sx_setup_env"
+    fi
+    [ -f "$dir/$ENV_FLAG" ] && ready=1
+    ensure_prereq "$key" "$job" "$ready" "$STATE_DIR/$name.attempts" \
         --partition="$ENV_PARTITION" --time=01:00:00 --mem=32G --gres="$GPU_GRES" \
-        "$SELF" --setup-env
+        "$SELF" --setup-env "$target"
 }
 
 ensure_model() {
@@ -1086,18 +1160,24 @@ run_pass() {
     local -a pyarr
     declare -A done_run=() run_running=() run_pending=() run_stuck=() model_ok=()
 
-    # 0) prerequisites: env, then every model of the plan
-    local env_ok=0
-    ensure_env && env_ok=1
+    # 0) prerequisites: every model's env (base or tf5), then the models themselves
+    local tgt
+    declare -A env_ok=()
     for entry in "${PLAN[@]}"; do
         IFS='|' read -r phase method tag knobs model rest <<< "$entry"
         [ -n "${model_ok[$model]:-}" ] && continue
         model_ok[$model]=0
-        [ "$env_ok" -eq 1 ] && ensure_model "$model" && model_ok[$model]=1
+        tgt="$(env_target_for_model "$model")"
+        if [ -z "${env_ok[$tgt]:-}" ]; then
+            ensure_env "$tgt" && env_ok[$tgt]=1 || env_ok[$tgt]=0
+        fi
+        [ "${env_ok[$tgt]}" -eq 1 ] && ensure_model "$model" && model_ok[$model]=1
         [ "${model_ok[$model]}" -eq 1 ] || PREREQ_WAITING=1
     done
 
-    # 1) shards
+    # 1) shards. active_jobs: shard jobs already in the queue (sx_* but not env/download jobs)
+    local active_jobs
+    active_jobs=$(printf '%s\n' "$QUEUE" | awk -F'|' '$3 ~ /^sx_/ && $3 !~ /^sx_(setup|dl_)/ && $2 ~ /RUNNING|PENDING/' | wc -l)
     for entry in "${PLAN[@]}"; do
         IFS='|' read -r phase method tag knobs model dataset n seed run_dir n_shards isdef pyargs <<< "$entry"
         [ -n "${done_run[$run_dir]:-}" ] && continue          # same run in both phases
@@ -1135,7 +1215,7 @@ run_pass() {
                 gave_up "$key" "$label" "$attempts"
                 continue
             fi
-            if [ "$N_SUBMITTED" -ge "$MAX_SUBMIT_PER_PASS" ]; then
+            if [ "$N_SUBMITTED" -ge "$MAX_SUBMIT_PER_PASS" ] || [ $(( active_jobs + N_SUBMITTED )) -ge "$MAX_ACTIVE_JOBS" ]; then
                 n_deferred=$((n_deferred + 1))
                 continue
             fi
@@ -1254,7 +1334,7 @@ for a in ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}; do
 done
 
 # One line per (re-)initialization recording the config this instance runs with.
-log "INIT Sela_beat server=$SERVER job=${SLURM_JOB_ID:-standalone} root=$SELA_ROOT tree=$TREE phases=(${PHASES[*]}) methods=(${METHODS[*]}) combos=(${COMBOS[*]}) models=(${MODELS[*]}) datasets=(${DATASETS[*]}) seeds=(${SEEDS[*]}) n=$N_SAMPLES sweep=(${SWEEP_METHODS[*]}|${SWEEP_DATASETS[*]}|n=$SWEEP_N_SAMPLES|$SWEEP_MODE) preset=$SELAR_PRESET partition=$GPU_PARTITION interval=${CHECK_INTERVAL}s reinit_at=${REINIT_AT}s once=$ONCE dry_run=$DRY_RUN status_only=$STATUS_ONLY"
+log "INIT Sela_beat server=$SERVER job=${SLURM_JOB_ID:-standalone} root=$SELA_ROOT env=$ENV_NAME/$ENV_NAME_TF5 tree=$TREE phases=(${PHASES[*]}) methods=(${METHODS[*]}) combos=(${COMBOS[*]}) models=(${MODELS[*]}) datasets=(${DATASETS[*]}) seeds=(${SEEDS[*]}) n=$N_SAMPLES sweep=(${SWEEP_METHODS[*]}|${SWEEP_DATASETS[*]}|n=$SWEEP_N_SAMPLES|$SWEEP_MODE) preset=$SELAR_PRESET partition=$GPU_PARTITION interval=${CHECK_INTERVAL}s reinit_at=${REINIT_AT}s once=$ONCE dry_run=$DRY_RUN status_only=$STATUS_ONLY"
 
 reinitialize() {
     # Hand off to a fresh instance before the wall clock ("initialize itself

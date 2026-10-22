@@ -23,7 +23,8 @@
 #               A40 = 48 GB, so BATCH_SIZE and SHARD_SIZE are halved
 #               (GPU_SCALE=0.5). BENDER_GPU=A100: the A100* partitions.
 #   venv        sela_data/env_a40 (Python module from the default, Intel tree)
-#               or sela_data/env_a100 (/software/easybuild-AMD_A100 tree, AVX2)
+#               or sela_data/env_a100 (/software/easybuild-AMD_A100 tree, AVX2);
+#               transformers 5 for TF5_MODELS (Qwen3.5) in env_tf5_a40/env_tf5_a100
 #   report      ./result/selar_report_bender.md (reporting_bender.sh)
 # Every job it submits (shards, env build, downloads, its own re-init after
 # ~24h) runs this file again, so all of them stay on bender's partitions.

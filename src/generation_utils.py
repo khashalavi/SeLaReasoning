@@ -6,6 +6,30 @@ import random
 import numpy as np
 
 
+def cache_select_batch(past_key_values, keep_idx):
+    """Keep only the batch rows `keep_idx` of a KV cache.
+
+    transformers 5 hybrid models (Qwen3.5) mix DynamicLayer with
+    LinearAttentionLayer, which has no batch_select_indices: its conv /
+    recurrent states are indexed here directly."""
+    if past_key_values is None:
+        return
+    layers = getattr(past_key_values, "layers", None)
+    if layers is None:
+        if hasattr(past_key_values, "batch_select_indices"):
+            past_key_values.batch_select_indices(keep_idx)
+        return
+    for layer in layers:
+        if hasattr(layer, "batch_select_indices"):
+            layer.batch_select_indices(keep_idx)
+            continue
+        for i in range(layer.number_of_states):
+            if layer.is_conv_states_initialized[i]:
+                layer.conv_states[i] = layer.conv_states[i].index_select(0, keep_idx.to(layer.conv_states[i].device))
+            if layer.is_recurrent_states_initialized[i]:
+                layer.recurrent_states[i] = layer.recurrent_states[i].index_select(0, keep_idx.to(layer.recurrent_states[i].device))
+
+
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -139,8 +163,7 @@ def generate_cot(model, tokenizer, **kwargs):
         attention_mask = attention_mask[keep_idx]
         attn_mask = attn_mask[keep_idx]
         keep_idx_tensor = keep_idx if isinstance(keep_idx, torch.Tensor) else torch.tensor(keep_idx, dtype=torch.long, device=generated.device)
-        if hasattr(past_key_values, "batch_select_indices"):
-            past_key_values.batch_select_indices(keep_idx_tensor)
+        cache_select_batch(past_key_values, keep_idx_tensor)
 
     maxlen = max(len(g) for g in all_generated)
     out = torch.full((batch_size, maxlen), tokenizer.pad_token_id or 0, dtype=torch.long, device=device)
@@ -330,8 +353,7 @@ def generate_selar(model, tokenizer, **kwargs):
             soft_embeds = soft_embeds[keep_idx]
         
         keep_idx_tensor = keep_idx if isinstance(keep_idx, torch.Tensor) else torch.tensor(keep_idx, dtype=torch.long, device=device)
-        if hasattr(past_key_values, "batch_select_indices"):
-            past_key_values.batch_select_indices(keep_idx_tensor)
+        cache_select_batch(past_key_values, keep_idx_tensor)
 
     # Final output
     maxlen = max(len(g) for g in all_generated)
@@ -519,9 +541,8 @@ def generate_swir(model, tokenizer, **kwargs):
         mode_stay_steps = mode_stay_steps[keep_idx]
         cur_ref_entropy = cur_ref_entropy[keep_idx]
         locked_normal_mask = locked_normal_mask[keep_idx]
-        if hasattr(past_key_values, "batch_select_indices"):
-            keep_idx_tensor = keep_idx if isinstance(keep_idx, torch.Tensor) else torch.tensor(keep_idx, dtype=torch.long, device=device)
-            past_key_values.batch_select_indices(keep_idx_tensor)
+        keep_idx_tensor = keep_idx if isinstance(keep_idx, torch.Tensor) else torch.tensor(keep_idx, dtype=torch.long, device=device)
+        cache_select_batch(past_key_values, keep_idx_tensor)
         if max_switch_count is not None:
             switch_count = switch_count[keep_idx]
             injecting = injecting[keep_idx]

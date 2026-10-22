@@ -32,7 +32,7 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn.functional as F
 
-from src.generation_utils import apply_sampling_filter
+from src.generation_utils import apply_sampling_filter, cache_select_batch
 
 IDEAS = ("layer", "sem", "ltr", "fhg", "dynk")
 ENTROPY_BINS = 20
@@ -361,7 +361,9 @@ class _Hooks:
         if cfg.fhg:
             first = 0 if cfg.fhg_layers == "all" else n_layers // 2
             for layer in layers[first:]:
-                self.handles.append(layer.self_attn.register_forward_hook(self._attn_hook))
+                # hybrid models (Qwen3.5): linear-attention layers call their token mixer linear_attn
+                mixer = layer.self_attn if hasattr(layer, "self_attn") else layer.linear_attn
+                self.handles.append(mixer.register_forward_hook(self._attn_hook))
                 self.handles.append(layer.mlp.register_forward_hook(self._mlp_hook))
         if cfg.layer:
             self.l_star = min(max(int(cfg.layer_frac * n_layers), 0), n_layers - 2)
@@ -628,7 +630,7 @@ def generate_selarx(model, tokenizer, input_ids, attention_mask, cfg, *,
                     gate.select(keep_idx)
                 if hooks is not None:
                     hooks.select(keep_idx)
-                past_key_values.batch_select_indices(keep_idx)
+                cache_select_batch(past_key_values, keep_idx)
     finally:
         if hooks is not None:
             hooks.remove()
